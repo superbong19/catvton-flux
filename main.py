@@ -24,7 +24,7 @@ candidate_bases = [
     os.environ.get("WORKDIR", "/root/app"),
     os.path.dirname(__file__),
     os.getcwd(),
-    "/root/app",
+    "/root/app2",
     "/root",
     "/workspace",
     "/home",
