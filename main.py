@@ -10,32 +10,87 @@ from diffusers.utils import load_image
 from google import genai
 from google.genai import types
 
+# =========================
+# FastAPI app
+# =========================
 app = FastAPI(title="FLUX Virtual Try-On API")
 
-# Load pipeline global
-transformer = FluxTransformer2DModel.from_pretrained(
-    "xiaozaa/catvton-flux-beta",  torch_dtype=torch.bfloat16
-)
-pipe = FluxFillPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-dev",
-    transformer=transformer,
-    torch_dtype=torch.bfloat16
-).to("cuda")
-pipe.transformer.to(torch.bfloat16)
+# =========================
+# Directories (robust lookup)
+# =========================
+# The app may be run in different environments (local, Modal container, etc.).
+# Try several candidate base paths and pick the first that contains an `assets/` folder.
+candidate_bases = [
+    os.environ.get("WORKDIR", "/root/app"),
+    os.path.dirname(__file__),
+    os.getcwd(),
+    "/root/app",
+    "/root",
+    "/workspace",
+    "/home",
+]
 
+APP_BASE = None
+for base in candidate_bases:
+    try:
+        if base and os.path.isdir(os.path.join(base, "assets")):
+            APP_BASE = base
+            break
+    except Exception:
+        continue
+
+if APP_BASE is None:
+    # fallback to WORKDIR env or /root/app
+    APP_BASE = os.environ.get("WORKDIR", "/root/app")
+
+WORKDIR = APP_BASE
+UPLOAD_DIR = os.path.join(WORKDIR, "uploads")
+POSE_DIR = os.path.join(WORKDIR, "assets/poses")
+MASK_DIR = os.path.join(WORKDIR, "assets/masks")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Helpful debug info in logs about where assets are loaded from
+print(f"[main] WORKDIR={WORKDIR}")
+print(f"[main] POSE_DIR={POSE_DIR}")
+print(f"[main] MASK_DIR={MASK_DIR}")
+
+# =========================
+# Transforms
+# =========================
 transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.5], [0.5])
 ])
 mask_transform = transforms.Compose([transforms.ToTensor()])
 
-UPLOAD_DIR = "./uploads"
-POSE_DIR = "./assets/poses"
-MASK_DIR = "./assets/masks"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# =========================
+# Lazy-load FLUX pipeline
+# =========================
+pipe = None
+transformer = None
 
+def get_pipe():
+    global pipe, transformer
+    if pipe is None:
+        transformer = FluxTransformer2DModel.from_pretrained(
+            "xiaozaa/catvton-flux-beta", torch_dtype=torch.bfloat16
+        )
+        pipe = FluxFillPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-dev",
+            transformer=transformer,
+            torch_dtype=torch.bfloat16
+        ).to("cuda")
+        pipe.transformer.to(torch.bfloat16)
+    return pipe
+
+# =========================
+# Run inference
+# =========================
 def run_inference(image_path, mask_path, garment_path, size=(576, 768),
                   num_steps=50, guidance_scale=30, seed=42):
+
+    pipe = get_pipe()
+
     image = load_image(image_path).convert("RGB").resize(size)
     mask = load_image(mask_path).convert("RGB").resize(size)
     garment = load_image(garment_path).convert("RGB").resize(size)
@@ -72,21 +127,20 @@ def run_inference(image_path, mask_path, garment_path, size=(576, 768),
     width = size[0]
     tryon_result = result.crop((width, 0, width * 2, size[1]))
 
-    # 🔥 Xuất file PNG (không nén, giữ chất lượng cao)
     img_bytes = io.BytesIO()
     tryon_result.save(img_bytes, format="PNG")
     img_bytes.seek(0)
     return img_bytes
 
+# =========================
+# Describe image with GenAI
+# =========================
 def describe_image(garment: UploadFile = File(...)):
-    # đọc bytes từ UploadFile
     image_bytes = garment.file.read()
     garment.file.seek(0)
 
-    # tạo client
-    client = genai.Client(api_key="")
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
-    # nội dung gửi vào: ảnh + prompt
     contents = [
         types.Part.from_bytes(
             data=image_bytes,
@@ -96,24 +150,25 @@ def describe_image(garment: UploadFile = File(...)):
 You are an image classification AI. Analyze the input image and identify the type of outfit shown. 
 Return ONLY one label in lowercase from the following fixed set:
 
-- "upper" → if the main item is a top (shirt, t-shirt, jacket, hoodie, sweater, blouse, crop-top, etc.)
-- "lower" → if the main item is a bottom (pants, jeans, shorts, skirt, leggings, etc.)
-- "full" → if the outfit is a one-piece (dress, jumpsuit, bodysuit, long coat covering whole body, etc.)
-- "full" → if the image does not clearly show an outfit or does not fit the above categories.
+- "upper" → if the main item is a top
+- "lower" → if the main item is a bottom
+- "full" → if the outfit is a one-piece
+- "other" → if the image does not clearly show an outfit
 
 Your response must contain ONLY one word: upper, lower, full, or other.
 """
     ]
 
-    # gọi API
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=contents
     )
 
-    print(response.text)
-    return response.text
+    return response.text.strip()
 
+# =========================
+# API Endpoint
+# =========================
 @app.post("/tryon/")
 async def virtual_tryon(
     garment: UploadFile = File(...),
@@ -123,14 +178,14 @@ async def virtual_tryon(
     width: int = Form(576),
     height: int = Form(768),
 ):
+
     if not (1 <= pose_id <= 12):
         raise HTTPException(status_code=400, detail="pose_id must be between 1 and 12")
 
     image_path = os.path.join(POSE_DIR, f"pose-{pose_id}.jpeg")
     mask_type = describe_image(garment)
     mask_path = os.path.join(MASK_DIR, f"{mask_type}/mask-{pose_id}.png")
-    print("Using mask:", mask_path)
-    
+
     if not os.path.exists(image_path) or not os.path.exists(mask_path):
         raise HTTPException(status_code=404, detail="Pose or mask file not found")
 
@@ -147,5 +202,4 @@ async def virtual_tryon(
         seed=seed
     )
 
-    # Trả PNG chất lượng cao
     return StreamingResponse(img_bytes, media_type="image/png")
